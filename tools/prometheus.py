@@ -40,6 +40,8 @@ AGE_DIR = CONFIG_DIR / "age"
 AGE_IDENTITY = AGE_DIR / "identity.txt"  # private age key
 AGE_RECIPIENT = AGE_DIR / "recipient.txt"  # public age recipient
 
+DELEGATIONS_DIR = CONFIG_DIR / "delegations"  # key rotation proofs
+
 
 class ShellError(RuntimeError):
     pass
@@ -68,8 +70,10 @@ def ensure_tools() -> None:
 def ensure_dirs() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     AGE_DIR.mkdir(parents=True, exist_ok=True)
+    DELEGATIONS_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(CONFIG_DIR, 0o700)
     os.chmod(AGE_DIR, 0o700)
+    os.chmod(DELEGATIONS_DIR, 0o700)
 
 
 def ensure_signing_key() -> None:
@@ -89,8 +93,10 @@ def ensure_signing_key() -> None:
     ])
     os.chmod(SIGNING_KEY, 0o600)
     os.chmod(SIGNING_PUB, 0o644)
-    # allowed_signers format: principal namespaces key
+
     pub = SIGNING_PUB.read_text().strip()
+    # allowed_signers format: principal key
+    # (We keep this simple for v0.1)
     ALLOWED_SIGNERS.write_text(f"prometheus {pub}\n")
     os.chmod(ALLOWED_SIGNERS, 0o644)
 
@@ -209,33 +215,42 @@ def write_manifest(path: Path, manifest: dict) -> None:
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
 
-def sign_manifest(manifest_path: Path, sig_path: Path) -> None:
-    # Use ssh-keygen signing (OpenSSH 8.2+):
-    # ssh-keygen -Y sign -f <privatekey> -n <namespace> <file>
-    # creates <file>.sig by default.
-    sh(["ssh-keygen", "-Y", "sign", "-f", str(SIGNING_KEY), "-n", "prometheus", str(manifest_path)])
-    generated = manifest_path.with_suffix(manifest_path.suffix + ".sig")
+def ssh_sign_file(file_path: Path, sig_path: Path, *, namespace: str, key_path: Path) -> None:
+    """Sign file_path with key_path and write detached signature to sig_path."""
+    sh(["ssh-keygen", "-Y", "sign", "-f", str(key_path), "-n", namespace, str(file_path)])
+    generated = file_path.with_suffix(file_path.suffix + ".sig")
     if not generated.exists():
         raise ShellError("ssh-keygen did not produce a .sig file")
     generated.replace(sig_path)
 
 
-def verify_signature(manifest_path: Path, sig_path: Path) -> None:
+def sign_manifest(manifest_path: Path, sig_path: Path) -> None:
+    ssh_sign_file(manifest_path, sig_path, namespace="prometheus", key_path=SIGNING_KEY)
+
+
+def ssh_verify_file(file_path: Path, sig_path: Path, *, namespace: str, principal: str = "prometheus") -> None:
     # ssh-keygen -Y verify -f allowed_signers -I principal -n namespace -s sigfile < file
-    data = manifest_path.read_bytes()
-    sh([
-        "ssh-keygen",
-        "-Y",
-        "verify",
-        "-f",
-        str(ALLOWED_SIGNERS),
-        "-I",
-        "prometheus",
-        "-n",
-        "prometheus",
-        "-s",
-        str(sig_path),
-    ], input_bytes=data)
+    data = file_path.read_bytes()
+    sh(
+        [
+            "ssh-keygen",
+            "-Y",
+            "verify",
+            "-f",
+            str(ALLOWED_SIGNERS),
+            "-I",
+            principal,
+            "-n",
+            namespace,
+            "-s",
+            str(sig_path),
+        ],
+        input_bytes=data,
+    )
+
+
+def verify_signature(manifest_path: Path, sig_path: Path) -> None:
+    ssh_verify_file(manifest_path, sig_path, namespace="prometheus")
 
 
 def tar_bundle(bundle_dir: Path, tar_path: Path) -> None:
@@ -280,6 +295,89 @@ def cmd_init(_: argparse.Namespace) -> None:
     print("Initialized:")
     print(f"- signing pubkey: {SIGNING_PUB}")
     print(f"- age recipient: {AGE_RECIPIENT.read_text().strip()}")
+
+
+def cmd_rotate_signing_key(args: argparse.Namespace) -> None:
+    """Rotate signing key and emit a signed delegation proof.
+
+    v0.1 semantics:
+    - create a new ed25519 keypair
+    - create delegation.json signed by the *old* key
+    - update allowed_signers to include BOTH keys (old and new)
+    """
+    ensure_tools()
+    ensure_dirs()
+    ensure_signing_key()
+
+    ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    old_pub = SIGNING_PUB.read_text().strip()
+
+    # Create new keypair in temp location
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        new_key = td / "signing_ed25519"
+        sh([
+            "ssh-keygen",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            f"prometheus-signing-rotated-{ts}",
+            "-f",
+            str(new_key),
+        ])
+        new_pub = (td / "signing_ed25519.pub").read_text().strip()
+
+        # Delegation statement
+        delegation = {
+            "kind": "prometheus.delegation.v0.1",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "from_public_key": old_pub,
+            "to_public_key": new_pub,
+            "reason": args.reason or "key rotation",
+        }
+
+        delegation_path = DELEGATIONS_DIR / f"delegation-{ts}.json"
+        sig_path = DELEGATIONS_DIR / f"delegation-{ts}.sig"
+        delegation_path.write_text(json.dumps(delegation, indent=2, sort_keys=True) + "\n")
+
+        # Sign delegation using old key BEFORE overwriting
+        ssh_sign_file(delegation_path, sig_path, namespace="prometheus-delegation", key_path=SIGNING_KEY)
+
+        # Backup old keypair
+        backup_dir = CONFIG_DIR / "signing-backups" / ts
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(SIGNING_KEY, backup_dir / SIGNING_KEY.name)
+        shutil.copy2(SIGNING_PUB, backup_dir / SIGNING_PUB.name)
+
+        # Install new keypair
+        shutil.copy2(new_key, SIGNING_KEY)
+        shutil.copy2(td / "signing_ed25519.pub", SIGNING_PUB)
+        os.chmod(SIGNING_KEY, 0o600)
+        os.chmod(SIGNING_PUB, 0o644)
+
+    # Update allowed_signers to include both old and new
+    current_new_pub = SIGNING_PUB.read_text().strip()
+    ALLOWED_SIGNERS.write_text(f"prometheus {old_pub}\n" f"prometheus {current_new_pub}\n")
+
+    print("Rotated signing key.")
+    print(f"- new pubkey: {current_new_pub}")
+    print(f"- delegation: {delegation_path}")
+    print(f"- signature: {sig_path}")
+
+
+def cmd_verify_delegation(args: argparse.Namespace) -> None:
+    ensure_tools()
+    ensure_dirs()
+
+    dpath = Path(args.delegation).expanduser().resolve()
+    spath = Path(args.signature).expanduser().resolve()
+    if not dpath.exists() or not spath.exists():
+        raise SystemExit("delegation or signature file not found")
+
+    ssh_verify_file(dpath, spath, namespace="prometheus-delegation")
+    print("OK")
 
 
 def cmd_export(args: argparse.Namespace) -> None:
@@ -451,6 +549,15 @@ def main() -> None:
     sp.add_argument("--dry-run", action="store_true", help="print actions without writing")
     sp.add_argument("--no-clobber", action="store_true", help="refuse to overwrite existing files")
     sp.set_defaults(func=cmd_import)
+
+    sp = sub.add_parser("rotate-signing-key", help="Rotate signing key and create a signed delegation proof")
+    sp.add_argument("--reason", help="why the key is being rotated")
+    sp.set_defaults(func=cmd_rotate_signing_key)
+
+    sp = sub.add_parser("verify-delegation", help="Verify a delegation proof signature")
+    sp.add_argument("delegation", help="path to delegation-*.json")
+    sp.add_argument("signature", help="path to delegation-*.sig")
+    sp.set_defaults(func=cmd_verify_delegation)
 
     args = p.parse_args()
     args.func(args)
