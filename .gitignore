@@ -10,6 +10,7 @@ TOOLS.md
 memory/
 .openclaw/
 .config/
+bundles/
 *.key
 *.pem
 *.age
