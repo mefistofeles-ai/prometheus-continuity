@@ -318,27 +318,83 @@ def cmd_export(args: argparse.Namespace) -> None:
         print(str(bp.enc_path))
 
 
-def cmd_verify(args: argparse.Namespace) -> None:
+@dataclass
+class VerifiedBundle:
+    tmp: tempfile.TemporaryDirectory
+    bundle_dir: Path
+
+
+def _decrypt_and_verify(enc_path: Path) -> VerifiedBundle:
+    """Decrypt bundle to a temp dir and verify signature + hashes."""
     ensure_tools()
     ensure_dirs()
 
+    td = tempfile.TemporaryDirectory()
+    work_dir = Path(td.name)
+    tar_path = work_dir / "bundle.tar"
+    age_decrypt(enc_path, tar_path)
+    bundle_dir = extract_tar(tar_path, work_dir)
+
+    manifest_path = bundle_dir / "manifest.json"
+    sig_path = bundle_dir / "manifest.sig"
+
+    verify_signature(manifest_path, sig_path)
+    verify_hashes(bundle_dir)
+
+    return VerifiedBundle(tmp=td, bundle_dir=bundle_dir)
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
     enc_path = Path(args.bundle).expanduser().resolve()
     if not enc_path.exists():
         raise SystemExit(f"bundle not found: {enc_path}")
 
-    with tempfile.TemporaryDirectory() as td:
-        work_dir = Path(td)
-        tar_path = work_dir / "bundle.tar"
-        age_decrypt(enc_path, tar_path)
-        bundle_dir = extract_tar(tar_path, work_dir)
+    vb = _decrypt_and_verify(enc_path)
+    vb.tmp.cleanup()
+    print("OK")
 
-        manifest_path = bundle_dir / "manifest.json"
-        sig_path = bundle_dir / "manifest.sig"
 
-        verify_signature(manifest_path, sig_path)
-        verify_hashes(bundle_dir)
+def _safe_relpath(p: Path) -> str:
+    rel = p.as_posix()
+    if rel.startswith("/") or rel.startswith("\\") or ".." in Path(rel).parts:
+        raise ShellError(f"unsafe path in bundle: {rel}")
+    return rel
 
-        print("OK")
+
+def cmd_import(args: argparse.Namespace) -> None:
+    enc_path = Path(args.bundle).expanduser().resolve()
+    if not enc_path.exists():
+        raise SystemExit(f"bundle not found: {enc_path}")
+
+    target = Path(args.target).expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True)
+
+    vb = _decrypt_and_verify(enc_path)
+    try:
+        bundle_dir = vb.bundle_dir
+        payload_root = bundle_dir / "payload"
+        if not payload_root.exists():
+            raise ShellError("bundle missing payload/")
+
+        actions = []
+        for src in sorted(payload_root.rglob("*")):
+            if src.is_dir():
+                continue
+            rel = _safe_relpath(src.relative_to(payload_root))
+            dst = target / rel
+            actions.append((src, dst))
+
+        for src, dst in actions:
+            if args.no_clobber and dst.exists():
+                raise ShellError(f"refusing to overwrite existing file: {dst}")
+            if args.dry_run:
+                print(f"WOULD_WRITE {dst}")
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            print(f"WROTE {dst}")
+    finally:
+        vb.tmp.cleanup()
 
 
 def main() -> None:
@@ -357,6 +413,13 @@ def main() -> None:
     sp = sub.add_parser("verify", help="Verify an encrypted bundle (signature + hashes)")
     sp.add_argument("bundle", help="path to .tar.age bundle")
     sp.set_defaults(func=cmd_verify)
+
+    sp = sub.add_parser("import", help="Verify then apply a bundle payload into a target directory")
+    sp.add_argument("bundle", help="path to .tar.age bundle")
+    sp.add_argument("--target", required=True, help="target directory to apply payload into")
+    sp.add_argument("--dry-run", action="store_true", help="print actions without writing")
+    sp.add_argument("--no-clobber", action="store_true", help="refuse to overwrite existing files")
+    sp.set_defaults(func=cmd_import)
 
     args = p.parse_args()
     args.func(args)
