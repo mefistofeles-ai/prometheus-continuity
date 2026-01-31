@@ -11,6 +11,7 @@ memory/
 .openclaw/
 .config/
 bundles/
+POSTS.md
 *.key
 *.pem
 *.age
