@@ -30,12 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PAYLOAD_ALLOW_PREFIXES = [
-    "docs/",
-    "README.md",
-    "LICENSE",
-    ".gitignore",
-]
+DEFAULT_POLICY_PATH = REPO_ROOT / "policy" / "export-allowlist.txt"
 
 CONFIG_DIR = Path.home() / ".config" / "prometheus"
 SIGNING_KEY = CONFIG_DIR / "signing_ed25519"
@@ -131,8 +126,29 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def is_allowed_default(rel: str) -> bool:
-    return any(rel == p or rel.startswith(p) for p in DEFAULT_PAYLOAD_ALLOW_PREFIXES)
+def read_allowlist(path: Path) -> list[str]:
+    if not path.exists():
+        raise ShellError(
+            f"export policy not found: {path}. Create it or pass --allowlist."
+        )
+    lines: list[str] = []
+    for raw in path.read_text().splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        lines.append(s)
+    return lines
+
+
+def is_allowed_by_policy(rel: str, rules: list[str]) -> bool:
+    for rule in rules:
+        if rule.endswith("/"):
+            if rel.startswith(rule):
+                return True
+        else:
+            if rel == rule:
+                return True
+    return False
 
 
 def list_repo_files() -> list[str]:
@@ -275,12 +291,15 @@ def cmd_export(args: argparse.Namespace) -> None:
     out_dir = Path(args.out).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    allowlist = read_allowlist(Path(args.allowlist).expanduser())
     include = set(args.include or [])
     tracked = list_repo_files()
 
     payload_list: list[str] = []
     for rel in tracked:
-        if is_allowed_default(rel) or rel in include or any(rel.startswith(p.rstrip("/") + "/") for p in include):
+        if is_allowed_by_policy(rel, allowlist) or rel in include or any(
+            rel.startswith(p.rstrip("/") + "/") for p in include
+        ):
             payload_list.append(rel)
 
     if not payload_list:
@@ -300,6 +319,13 @@ def cmd_export(args: argparse.Namespace) -> None:
             dst = bp.payload_dir / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
+
+        # Record allowlist used (as provenance) if it exists.
+        allowlist_src = Path(args.allowlist).expanduser().resolve()
+        if allowlist_src.exists():
+            prov_dst = bp.payload_dir / "policy" / "export-allowlist.used.txt"
+            prov_dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(allowlist_src, prov_dst)
 
         public_key = SIGNING_PUB.read_text().strip()
         manifest = build_manifest(bp.payload_dir, agent_name=args.agent_name, public_key=public_key)
@@ -407,7 +433,12 @@ def main() -> None:
     sp = sub.add_parser("export", help="Export an encrypted, signed bundle")
     sp.add_argument("--out", default=str(REPO_ROOT / "bundles"), help="output directory")
     sp.add_argument("--agent-name", default="mefistofeles-ai", help="agent name")
-    sp.add_argument("--include", action="append", help="extra repo path(s) to include")
+    sp.add_argument(
+        "--allowlist",
+        default=str(DEFAULT_POLICY_PATH),
+        help="path to export allowlist (repo-relative paths)",
+    )
+    sp.add_argument("--include", action="append", help="extra repo path(s) to include (discouraged)")
     sp.set_defaults(func=cmd_export)
 
     sp = sub.add_parser("verify", help="Verify an encrypted bundle (signature + hashes)")

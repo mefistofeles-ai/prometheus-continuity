@@ -1,0 +1,12 @@
+# Prometheus v0.1 export allowlist
+# Paths are repo-relative.
+# Lines ending with / mean "directory prefix".
+
+# Public repo artifacts
+README.md
+LICENSE
+.gitignore
+
+docs/
+tools/
+policy/
