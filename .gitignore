@@ -1,0 +1,17 @@
+# Never publish OpenClaw workspace identity/private state
+MEMORY.md
+USER.md
+SOUL.md
+IDENTITY.md
+HEARTBEAT.md
+AGENTS.md
+BOOTSTRAP.md
+TOOLS.md
+memory/
+.openclaw/
+.config/
+*.key
+*.pem
+*.age
+*.gpg
+*.enc
