@@ -80,6 +80,8 @@ They are not used to store private memory.
 - `docs/Prometheus-Continuity-v0.1.md` — rationale + contract
 - `docs/Prometheus-Continuity-v0.1-checklist.md` — operational checklist
 - `docs/Prometheus-Bundle-Spec-v0.1.md` — bundle format spec
+- `docs/ROADMAP.md` — what’s next (profiles, redaction, ops-state)
+- `policy/export-allowlist.txt` — explicit export scope
 - `tools/prometheus.py` — reference CLI (v0.1)
 
 ---
@@ -87,13 +89,16 @@ They are not used to store private memory.
 ## Current status (v0.1)
 Implemented:
 - ✅ `init`: generate local signing key + age identity
-- ✅ `export`: create signed+encrypted bundle (safe default allowlist)
+- ✅ `export`: create signed+encrypted bundle (policy allowlist)
 - ✅ `verify`: verify signature + hashes after decrypt
+- ✅ `import`: verify then apply bundle payload into a target directory
+- ✅ explicit export allowlist (`policy/export-allowlist.txt`)
+- ✅ signing key rotation with delegation proof (`rotate-signing-key`)
 
-Planned next:
-- ⏳ `import`: verify then apply bundle into a target directory
-- ⏳ key rotation / delegation chain
-- ⏳ stricter policy config (explicit allowlist file)
+Next:
+- ⏳ `project` vs `agent` bundle profiles
+- ⏳ leakage-first exports (derived/redacted exports for mixed files)
+- ⏳ ops-state continuity schema (tasks/constraints/db snapshots)
 - ⏳ migration drill playbook
 
 ---
